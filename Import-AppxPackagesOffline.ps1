@@ -197,7 +197,7 @@ Write-Host ""
 Write-Host "---> Zusammenfassung:"
 $results | Format-Table -AutoSize
 
-$failCount = ($results | Where-Object Status -eq "FAIL").Count
+$failCount = @($results | Where-Object Status -eq "FAIL").Count
 if ($failCount -gt 0) {
     Write-Warning "$failCount Paket(e) konnten nicht installiert werden. Details siehe obige Tabelle."
     exit 1
