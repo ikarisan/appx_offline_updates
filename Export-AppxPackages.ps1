@@ -1,45 +1,69 @@
 <#
 .SYNOPSIS
-    Exportiert ausgewaehlte, bereits installierte APPX/MSIX-Pakete inkl. aller
-    Abhaengigkeiten von diesem (Online-)Geraet zur spaeteren Offline-Installation
-    auf einem Air-Gapped Zielsystem.
+    Laedt ausgewaehlte APPX/MSIX-Pakete inkl. aller Abhaengigkeiten ueber
+    "winget download" herunter, zur spaeteren Offline-Installation auf einem
+    Air-Gapped Zielsystem.
 
 .DESCRIPTION
-    Nutzt Save-AppxPackage, um pro Paket einen eigenen Unterordner mit dem
+    Nutzt "winget download", um pro Paket einen eigenen Unterordner mit dem
     Hauptpaket (.appx/.appxbundle/.msix/.msixbundle) und einem automatisch
-    erzeugten "Dependencies"-Unterordner anzulegen.
+    von winget erzeugten "Dependencies"-Unterordner anzulegen. Das Paket muss
+    dafuer NICHT auf diesem Geraet installiert sein.
+
+    Hintergrund: Das fruehere Save-AppxPackage-Cmdlet (Appx-Modul) wurde von
+    Microsoft in aktuellen Windows-Versionen (24H2 und neuer) entfernt und
+    steht nicht mehr zur Verfuegung. "winget download" ist der offizielle
+    Ersatz.
+
+    Wichtig: Fuer Pakete, die ueber den Microsoft Store vertrieben werden
+    (die meisten vorinstallierten Windows-Apps wie Rechner, Sticky Notes,
+    Paint, Fotos, Notepad, To Do, ...), verlangt winget beim Download eine
+    interaktive Microsoft-Anmeldung (Microsoft Entra ID). Es kann sich dabei
+    ein Anmeldefenster oeffnen, das manuell ausgefuellt werden muss - das
+    Skript wartet in diesem Fall, bis der Download abgeschlossen ist.
+    Pakete aus dem offenen Winget-Community-Repository (z. B.
+    Microsoft.WindowsTerminal) benoetigen dagegen keine Anmeldung.
+
     Zusaetzlich wird ein Manifest (export-manifest.csv) mit SHA256-Hashes
     geschrieben, damit die Paketintegritaet nach dem Transfer auf dem
-    Zielsystem geprueft werden kann.
+    Zielsystem geprueft werden kann (kompatibel mit
+    Import-AppxPackagesOffline.ps1 -VerifyHash).
 
 .PARAMETER PackageNames
-    Ein oder mehrere Appx-Paketnamen (Get-AppxPackage -Name Wert), z. B.
-    "Microsoft.MicrosoftStickyNotes". Wenn dieser Parameter angegeben wird,
-    hat er Vorrang: eine eventuell vorhandene packages.txt (Default oder
-    ueber -PackageListFile angegeben) wird dann komplett ignoriert.
+    Ein oder mehrere Paket-Bezeichner. Erlaubt sind:
+      - Microsoft-Store-Produkt-IDs, z. B. "9WZDNCRFHVN5"
+      - Winget-Paket-IDs aus dem Community-Repo, z. B. "Microsoft.WindowsTerminal"
+      - Vollstaendige Microsoft-Store-Links, z. B.
+        "https://apps.microsoft.com/detail/9NBLGGH4QGHW?hl=de&gl=DE"
+        (die Produkt-ID wird automatisch aus dem Link extrahiert)
+    Wenn dieser Parameter angegeben wird, hat er Vorrang: eine eventuell
+    vorhandene packages.txt (Default oder ueber -PackageListFile angegeben)
+    wird dann komplett ignoriert.
 
 .PARAMETER PackageListFile
-    Pfad zu einer Textdatei mit einem Appx-Paketnamen pro Zeile. Leere
-    Zeilen und Zeilen, die mit "#" beginnen, werden ignoriert (Kommentare).
-    Wird nur verwendet, wenn -PackageNames NICHT angegeben ist. Ohne
-    -PackageListFile wird in diesem Fall standardmaessig nach einer Datei
-    "packages.txt" im Skriptverzeichnis gesucht. Existiert weder
-    -PackageNames noch eine gueltige Paketliste, bricht das Skript mit
-    einem Fehler ab.
+    Pfad zu einer Textdatei mit einem Paket-Bezeichner pro Zeile (siehe
+    -PackageNames fuer die erlaubten Formate). Leere Zeilen und Zeilen, die
+    mit "#" beginnen, werden ignoriert (Kommentare). Wird nur verwendet,
+    wenn -PackageNames NICHT angegeben ist. Ohne -PackageListFile wird in
+    diesem Fall standardmaessig nach einer Datei "packages.txt" im
+    Skriptverzeichnis gesucht. Existiert weder -PackageNames noch eine
+    gueltige Paketliste, bricht das Skript mit einem Fehler ab.
 
 .PARAMETER ExportRoot
     Zielordner fuer den Export. Wird angelegt, falls nicht vorhanden.
 
-.PARAMETER AllUsers
-    Ruft die Paketinfo mit Get-AppxPackage -AllUsers ab (erfordert
-    Administratorrechte). Ohne diesen Schalter wird nur im Kontext des
-    aktuell angemeldeten Benutzers gesucht (kein Admin noetig).
+.PARAMETER IncludeLicense
+    Laedt zusaetzlich die Offline-Lizenzdatei fuer Microsoft-Store-Pakete
+    herunter. Erfordert ein Microsoft-Entra-ID-Konto mit der Rolle "Globaler
+    Administrator", "Benutzeradministrator" oder "Lizenzadministrator".
+    Ohne diesen Schalter wird die Lizenz uebersprungen (--skip-license) -
+    ausreichend fuer kostenlose Standard-Apps.
 
 .EXAMPLE
-    .\Export-AppxPackages.ps1 -PackageNames "Microsoft.MicrosoftStickyNotes" -ExportRoot "D:\AppxExport"
+    .\Export-AppxPackages.ps1 -PackageNames "9WZDNCRFHVN5" -ExportRoot "D:\AppxExport"
 
 .EXAMPLE
-    .\Export-AppxPackages.ps1 -PackageNames "Microsoft.MicrosoftStickyNotes","Microsoft.WindowsCalculator" -ExportRoot "D:\AppxExport" -AllUsers
+    .\Export-AppxPackages.ps1 -PackageNames "Microsoft.WindowsTerminal","9WZDNCRFHVN5" -ExportRoot "D:\AppxExport"
 
 .EXAMPLE
     # Nutzt automatisch packages.txt im Skriptverzeichnis
@@ -49,10 +73,10 @@
     .\Export-AppxPackages.ps1 -PackageListFile "D:\pakete.txt" -ExportRoot "D:\AppxExport"
 
 .NOTES
-    Voraussetzung: Die angegebenen Pakete muessen auf diesem Geraet installiert
-    sein (fuer den aktuellen Benutzer oder, mit -AllUsers, fuer irgendeinen
-    Benutzer). Fehlt ein Paket, zuerst ueber Store/winget installieren und
-    einmal starten, dann das Skript erneut ausfuehren.
+    Voraussetzung: winget (App Installer) muss installiert sein. Bei
+    Microsoft-Store-Paketen kann waehrend des Downloads ein interaktives
+    Anmeldefenster erscheinen - das Skript ist in diesem Fall nicht
+    vollstaendig unbeaufsichtigt lauffaehig.
 #>
 
 [CmdletBinding()]
@@ -67,7 +91,7 @@ param(
     [string]$ExportRoot = ".\AppxExport",
 
     [Parameter(Mandatory = $false)]
-    [switch]$AllUsers
+    [switch]$IncludeLicense
 )
 
 if (-not $PackageNames) {
@@ -90,71 +114,60 @@ if (-not $PackageNames) {
     Write-Host "---> Paketliste geladen: $listPath ($($PackageNames.Count) Paket(e))"
 }
 
+function Resolve-WingetPackageId {
+    param([string]$Entry)
+
+    # Vollstaendigen Store-Link (z. B. https://apps.microsoft.com/detail/9NBLGGH4QGHW?hl=de)
+    # auf die reine Produkt-ID reduzieren.
+    if ($Entry -match "apps\.microsoft\.com/detail/([^/?#]+)") {
+        return $Matches[1]
+    }
+
+    return $Entry
+}
+
 $manifestEntries = @()
 
 if (-not (Test-Path -Path $ExportRoot)) {
     New-Item -Path $ExportRoot -ItemType Directory -Force | Out-Null
 }
 
-foreach ($name in $PackageNames) {
+foreach ($entry in $PackageNames) {
 
-    Write-Host "---> Verarbeite Paket: $name"
+    $id = Resolve-WingetPackageId -Entry $entry
+    $folderSafeId = ($id -replace '[<>:"/\\|?*]', "_")
 
-    $pkg = $null
-    try {
-        if ($AllUsers) {
-            $pkg = Get-AppxPackage -AllUsers -Name $name -ErrorAction Stop
-        }
-        else {
-            $pkg = Get-AppxPackage -Name $name -ErrorAction Stop
-        }
-    }
-    catch {
-        Write-Warning "[FAIL] Get-AppxPackage Fehler fuer '$name': $($_.Exception.Message)"
-        $manifestEntries += [PSCustomObject]@{
-            PackageName   = $name
-            Status        = "FAIL"
-            Detail        = "Get-AppxPackage Fehler: $($_.Exception.Message)"
-            Version       = $null
-            ExportPath    = $null
-            MainFile      = $null
-            SHA256        = $null
-            ExportedAtUtc = (Get-Date).ToUniversalTime().ToString("s")
-        }
-        continue
-    }
+    Write-Host "---> Verarbeite Paket: $entry$(if ($id -ne $entry) { " (Store-ID: $id)" })"
 
-    if (-not $pkg) {
-        Write-Warning "[SKIP] Paket nicht installiert: $name (zuerst ueber Store/winget installieren und einmal starten)"
-        $manifestEntries += [PSCustomObject]@{
-            PackageName   = $name
-            Status        = "SKIP"
-            Detail        = "Paket ist auf diesem Geraet nicht installiert"
-            Version       = $null
-            ExportPath    = $null
-            MainFile      = $null
-            SHA256        = $null
-            ExportedAtUtc = (Get-Date).ToUniversalTime().ToString("s")
-        }
-        continue
-    }
-
-    if ($pkg -is [array]) {
-        Write-Warning "[WARN] Mehrere Treffer fuer '$name', verwende den ersten: $($pkg[0].PackageFullName)"
-        $pkg = $pkg[0]
-    }
-
-    $destFolder = Join-Path -Path $ExportRoot -ChildPath $pkg.Name
+    $destFolder = Join-Path -Path $ExportRoot -ChildPath $folderSafeId
 
     try {
         if (-not (Test-Path -Path $destFolder)) {
             New-Item -Path $destFolder -ItemType Directory -Force | Out-Null
         }
 
-        Save-AppxPackage -Package $pkg -Path $destFolder -IncludeDependencies -ErrorAction Stop
+        $wingetArgs = @(
+            "download",
+            "--id", $id,
+            "--exact",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--download-directory", $destFolder
+        )
+        if (-not $IncludeLicense) {
+            $wingetArgs += "--skip-license"
+        }
+
+        $output = & winget @wingetArgs 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        Write-Host $output.Trim()
+
+        if ($exitCode -ne 0) {
+            throw "winget download beendete sich mit Exit-Code $exitCode"
+        }
 
         # Hauptpaketdatei ermitteln (liegt direkt im Zielordner, nicht im
-        # automatisch erzeugten Dependencies-Unterordner)
+        # von winget automatisch erzeugten Dependencies-Unterordner)
         $mainFile = Get-ChildItem -Path $destFolder -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in ".msixbundle", ".appxbundle" } |
             Select-Object -First 1
@@ -166,18 +179,23 @@ foreach ($name in $PackageNames) {
         }
 
         if (-not $mainFile) {
-            throw "Keine .msixbundle/.appxbundle/.msix/.appx Datei nach dem Export gefunden."
+            throw "Keine .msixbundle/.appxbundle/.msix/.appx Datei nach dem Download gefunden."
         }
 
         $hash = Get-FileHash -Path $mainFile.FullName -Algorithm SHA256
 
-        Write-Host "[OK] Exportiert: $($mainFile.Name) (Version $($pkg.Version))"
+        $version = $null
+        if ($mainFile.BaseName -match "_(\d+(?:\.\d+){1,3})_") {
+            $version = $Matches[1]
+        }
+
+        Write-Host "[OK] Heruntergeladen: $($mainFile.Name)"
 
         $manifestEntries += [PSCustomObject]@{
-            PackageName   = $name
+            PackageName   = $entry
             Status        = "OK"
             Detail        = ""
-            Version       = $pkg.Version
+            Version       = $version
             ExportPath    = $destFolder
             MainFile      = $mainFile.Name
             SHA256        = $hash.Hash
@@ -185,12 +203,12 @@ foreach ($name in $PackageNames) {
         }
     }
     catch {
-        Write-Warning "[FAIL] Export fehlgeschlagen fuer '$name': $($_.Exception.Message)"
+        Write-Warning "[FAIL] Download fehlgeschlagen fuer '$entry': $($_.Exception.Message)"
         $manifestEntries += [PSCustomObject]@{
-            PackageName   = $name
+            PackageName   = $entry
             Status        = "FAIL"
-            Detail        = "Save-AppxPackage Fehler: $($_.Exception.Message)"
-            Version       = $pkg.Version
+            Detail        = "winget download Fehler: $($_.Exception.Message)"
+            Version       = $null
             ExportPath    = $destFolder
             MainFile      = $null
             SHA256        = $null
@@ -205,10 +223,10 @@ $manifestEntries | Export-Csv -Path $manifestPath -NoTypeInformation -Encoding U
 Write-Host ""
 Write-Host "---> Manifest geschrieben: $manifestPath"
 
-$failCount = ($manifestEntries | Where-Object Status -ne "OK").Count
+$failCount = @($manifestEntries | Where-Object Status -ne "OK").Count
 if ($failCount -gt 0) {
-    Write-Warning "$failCount von $($manifestEntries.Count) Paket(en) konnten nicht vollstaendig exportiert werden. Details siehe Manifest."
+    Write-Warning "$failCount von $($manifestEntries.Count) Paket(en) konnten nicht vollstaendig heruntergeladen werden. Details siehe Manifest."
 }
 else {
-    Write-Host "Alle $($manifestEntries.Count) Paket(e) erfolgreich exportiert."
+    Write-Host "Alle $($manifestEntries.Count) Paket(e) erfolgreich heruntergeladen."
 }
