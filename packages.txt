@@ -1,9 +1,27 @@
+#
+# Sticky Notes
 https://apps.microsoft.com/detail/9NBLGGH4QGHW?hl=de&gl=DE&ocid=pdpshare
-https://apps.microsoft.com/detail/9PCFS5B6T72H?hl=de-de&gl=DE&ocid=pdpshare
-https://apps.microsoft.com/detail/9NFTCH6J7FHV?hl=de-de&gl=DE&ocid=pdpshare
-https://apps.microsoft.com/detail/9MZ95KL8MR0L?hl=de-de&gl=DE&ocid=pdpshare
-https://apps.microsoft.com/detail/9NBLGGH5R558?hl=de&gl=DE&ocid=pdpshare
-https://apps.microsoft.com/detail/9WZDNCRFJBH4?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Paint
+#https://apps.microsoft.com/detail/9PCFS5B6T72H?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Power Automate
+#https://apps.microsoft.com/detail/9NFTCH6J7FHV?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Ausschneiden und skizzieren
+#https://apps.microsoft.com/detail/9MZ95KL8MR0L?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Microsoft To Do
+#https://apps.microsoft.com/detail/9NBLGGH5R558?hl=de&gl=DE&ocid=pdpshare
+#
+# Microsoft Fotos
+#https://apps.microsoft.com/detail/9WZDNCRFJBH4?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Windows-Rechner
 https://apps.microsoft.com/detail/9WZDNCRFHVN5?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Windows Notepad
 https://apps.microsoft.com/detail/9MSMLRH6LZF3?hl=de-de&gl=DE&ocid=pdpshare
+#
+# Windows Terminal
 https://apps.microsoft.com/detail/9N0DX20HK701?hl=de-de&gl=DE&ocid=pdpshare

@@ -28,8 +28,11 @@
 
     Pro Paket wird ein eigener Unterordner mit der Hauptpaketdatei
     (.msix/.msixbundle) und einem "Dependencies"-Unterordner (exakt die
-    laut Paketmanifest benoetigten Abhaengigkeiten) angelegt. Zusaetzlich
-    wird ein Manifest (export-manifest.csv) mit SHA256-Hashes geschrieben,
+    laut Paketmanifest benoetigten Abhaengigkeiten) angelegt. Der
+    Unterordner wird nach dem Appx-Paketnamen benannt (z. B.
+    "Microsoft.WindowsCalculator"), nicht nach der Store-Produkt-ID oder
+    dem urspruenglich angegebenen Bezeichner. Zusaetzlich wird ein
+    Manifest (export-manifest.csv) mit SHA256-Hashes geschrieben,
     kompatibel mit Import-AppxPackagesOffline.ps1 -VerifyHash.
 
 .PARAMETER PackageNames
@@ -50,6 +53,17 @@
 .PARAMETER ExportRoot
     Zielordner fuer den Export. Wird angelegt, falls nicht vorhanden.
 
+.PARAMETER SkipExisting
+    Prueft vor jedem Download, ob im Zielordner bereits eine Datei mit der
+    gleichen Version vorliegt (erkennbar am Dateinamen). Ist das der Fall,
+    wird bei Store-Produkt-IDs zusaetzlich die tatsaechliche Dateigroesse
+    per HTTP-HEAD-Anfrage mit der bereits vorhandenen Datei verglichen -
+    nur bei uebereinstimmender Groesse wird der Download uebersprungen
+    (schuetzt vor einer unbemerkt unvollstaendigen/beschaedigten alten
+    Datei). Bei winget-Community-Paketen wird nur die Version geprueft
+    (kein Groessenvergleich moeglich, da winget die Dateigroesse vorab
+    nicht preisgibt). Ohne diesen Schalter wird immer neu heruntergeladen.
+
 .EXAMPLE
     .\Export-AppxPackages.ps1 -PackageNames "9WZDNCRFHVN5" -ExportRoot "D:\AppxExport"
 
@@ -59,6 +73,10 @@
 .EXAMPLE
     # Nutzt automatisch packages.txt im Skriptverzeichnis
     .\Export-AppxPackages.ps1 -ExportRoot "D:\AppxExport"
+
+.EXAMPLE
+    # Wiederholter Lauf: bereits vorhandene, unveraenderte Pakete werden uebersprungen
+    .\Export-AppxPackages.ps1 -ExportRoot "D:\AppxExport" -SkipExisting
 
 .NOTES
     Fuer winget-Community-Pakete muss winget (App Installer) installiert
@@ -74,7 +92,10 @@ param(
     [string]$PackageListFile,
 
     [Parameter(Mandatory = $false)]
-    [string]$ExportRoot = ".\AppxExport"
+    [string]$ExportRoot = ".\AppxExport",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipExisting
 )
 
 if (-not $PackageNames) {
@@ -147,10 +168,47 @@ function Compare-AppxVersion {
 
 #region winget-Pfad (Community-Pakete)
 
+function Get-ExistingMainFile {
+    param([string]$DestFolder)
+
+    $existing = Get-ChildItem -Path $DestFolder -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in ".msixbundle", ".appxbundle" } |
+        Select-Object -First 1
+    if (-not $existing) {
+        $existing = Get-ChildItem -Path $DestFolder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in ".msix", ".appx" } |
+            Select-Object -First 1
+    }
+    return $existing
+}
+
 function Export-PackageViaWinget {
-    param([string]$Entry, [string]$Id, [string]$DestFolder)
+    param([string]$Entry, [string]$Id, [string]$ExportRoot, [switch]$SkipExisting)
+
+    # Bei winget-Community-Paketen ist die ID selbst schon der Paketname
+    # (z. B. "Microsoft.WindowsTerminal") - passt direkt als Ordnername.
+    $folderSafeName = ($Id -replace '[<>:"/\\|?*]', "_")
+    $DestFolder = Join-Path -Path $ExportRoot -ChildPath $folderSafeName
+    if (-not (Test-Path -Path $DestFolder)) {
+        New-Item -Path $DestFolder -ItemType Directory -Force | Out-Null
+    }
 
     try {
+        if ($SkipExisting) {
+            $showOutput = & winget show --id $Id --exact --accept-source-agreements 2>&1 | Out-String
+            if ($showOutput -match "Version:\s*(\S+)") {
+                $availableVersion = $Matches[1]
+                if ($availableVersion -ne "Unknown") {
+                    $existing = Get-ExistingMainFile -DestFolder $DestFolder
+                    if ($existing -and $existing.BaseName -like "*$availableVersion*") {
+                        $hash = Get-FileHash -Path $existing.FullName -Algorithm SHA256
+                        Write-Host "[SKIP] Bereits vorhanden (Version $availableVersion): $($existing.Name)"
+                        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "Uebersprungen (bereits vorhanden, gleiche Version)" -Version $availableVersion -ExportPath $DestFolder -MainFile $existing.Name -SHA256 $hash.Hash
+                    }
+                }
+            }
+        }
+
         $wingetArgs = @(
             "download",
             "--id", $Id,
@@ -169,14 +227,7 @@ function Export-PackageViaWinget {
             throw "winget download beendete sich mit Exit-Code $exitCode"
         }
 
-        $mainFile = Get-ChildItem -Path $DestFolder -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Extension -in ".msixbundle", ".appxbundle" } |
-            Select-Object -First 1
-        if (-not $mainFile) {
-            $mainFile = Get-ChildItem -Path $DestFolder -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Extension -in ".msix", ".appx" } |
-                Select-Object -First 1
-        }
+        $mainFile = Get-ExistingMainFile -DestFolder $DestFolder
         if (-not $mainFile) {
             throw "Keine .msixbundle/.appxbundle/.msix/.appx Datei nach dem Download gefunden."
         }
@@ -394,12 +445,41 @@ function Get-PackageInfoFromZip {
     }
 }
 
-function Export-PackageViaStoreApi {
-    param([string]$Entry, [string]$ProductId, [string]$DestFolder)
+function Get-ExistingFileForMoniker {
+    param([string]$Folder, [string]$Moniker)
 
+    if (-not (Test-Path -Path $Folder)) { return $null }
+    return Get-ChildItem -Path $Folder -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -eq $Moniker } | Select-Object -First 1
+}
+
+function Test-RemoteSizeMatchesLocal {
+    param([string]$Url, [long]$LocalSize)
+
+    try {
+        $head = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -Headers $script:HttpHeaders
+        $remoteSize = [long]$head.Headers["Content-Length"]
+        return $remoteSize -eq $LocalSize
+    }
+    catch {
+        return $false
+    }
+}
+
+function Export-PackageViaStoreApi {
+    param([string]$Entry, [string]$ProductId, [string]$ExportRoot, [switch]$SkipExisting)
+
+    $DestFolder = $null
     try {
         $catalogInfo = Get-StoreCatalogInfo -ProductId $ProductId
         Write-Host "    Store-Katalog: $($catalogInfo.Title) ($($catalogInfo.MainName))"
+
+        # Ordner nach dem Paketnamen benennen (z. B. "Microsoft.WindowsCalculator"),
+        # nicht nach der rohen Store-Produkt-ID.
+        $folderSafeName = ($catalogInfo.MainName -replace '[<>:"/\\|?*]', "_")
+        $DestFolder = Join-Path -Path $ExportRoot -ChildPath $folderSafeName
+        if (-not (Test-Path -Path $DestFolder)) {
+            New-Item -Path $DestFolder -ItemType Directory -Force | Out-Null
+        }
 
         $candidates = @(Get-WuSyncCandidates -WuCategoryId $catalogInfo.WuCategoryId)
         if ($candidates.Count -eq 0) {
@@ -416,15 +496,24 @@ function Export-PackageViaStoreApi {
             throw "Keine Download-URL fuer Hauptpaket '$($main.Moniker)' erhalten."
         }
 
-        $tempMainPath = Join-Path -Path $DestFolder -ChildPath "_main.tmp"
-        Invoke-WebRequest -Uri $mainUrls[0] -OutFile $tempMainPath -UseBasicParsing -Headers $script:HttpHeaders
+        $existingMain = Get-ExistingFileForMoniker -Folder $DestFolder -Moniker $main.Moniker
+        if ($SkipExisting -and $existingMain -and (Test-RemoteSizeMatchesLocal -Url $mainUrls[0] -LocalSize $existingMain.Length)) {
+            $mainFilePath = $existingMain.FullName
+            $mainFileName = $existingMain.Name
+            Write-Host "[SKIP] Hauptpaket bereits vorhanden (gleiche Version/Groesse): $mainFileName"
+            $packageInfo = Get-PackageInfoFromZip -ZipPath $mainFilePath
+        }
+        else {
+            $tempMainPath = Join-Path -Path $DestFolder -ChildPath "_main.tmp"
+            Invoke-WebRequest -Uri $mainUrls[0] -OutFile $tempMainPath -UseBasicParsing -Headers $script:HttpHeaders
 
-        $packageInfo = Get-PackageInfoFromZip -ZipPath $tempMainPath
-        $mainFileName = "$($main.Moniker)$($packageInfo.Extension)"
-        $mainFilePath = Join-Path -Path $DestFolder -ChildPath $mainFileName
-        Move-Item -Path $tempMainPath -Destination $mainFilePath -Force
+            $packageInfo = Get-PackageInfoFromZip -ZipPath $tempMainPath
+            $mainFileName = "$($main.Moniker)$($packageInfo.Extension)"
+            $mainFilePath = Join-Path -Path $DestFolder -ChildPath $mainFileName
+            Move-Item -Path $tempMainPath -Destination $mainFilePath -Force
 
-        Write-Host "[OK] Hauptpaket heruntergeladen: $mainFileName"
+            Write-Host "[OK] Hauptpaket heruntergeladen: $mainFileName"
+        }
 
         $depFolder = Join-Path -Path $DestFolder -ChildPath "Dependencies"
         if ($packageInfo.DependencyNames.Count -gt 0) {
@@ -437,6 +526,11 @@ function Export-PackageViaStoreApi {
                 continue
             }
             $depUrls = @(Get-WuFileUrls -UpdateId $depCandidate.UpdateId -RevisionId $depCandidate.RevisionId)
+            $existingDep = Get-ExistingFileForMoniker -Folder $depFolder -Moniker $depCandidate.Moniker
+            if ($SkipExisting -and $existingDep -and $depUrls.Count -gt 0 -and (Test-RemoteSizeMatchesLocal -Url $depUrls[0] -LocalSize $existingDep.Length)) {
+                Write-Host "    [SKIP] Abhaengigkeit bereits vorhanden (gleiche Version/Groesse): $($existingDep.Name)"
+                continue
+            }
             foreach ($depUrl in $depUrls) {
                 $tempDepPath = Join-Path -Path $depFolder -ChildPath "_dep.tmp"
                 Invoke-WebRequest -Uri $depUrl -OutFile $tempDepPath -UseBasicParsing -Headers $script:HttpHeaders
@@ -1197,20 +1291,14 @@ if (-not (Test-Path -Path $ExportRoot)) {
 foreach ($entry in $PackageNames) {
 
     $id = Resolve-PackageIdentifier -Entry $entry
-    $folderSafeId = ($id -replace '[<>:"/\\|?*]', "_")
-    $destFolder = Join-Path -Path $ExportRoot -ChildPath $folderSafeId
-
-    if (-not (Test-Path -Path $destFolder)) {
-        New-Item -Path $destFolder -ItemType Directory -Force | Out-Null
-    }
 
     if ($id -match "\.") {
         Write-Host "---> Verarbeite Paket: $entry (winget-Community-ID: $id)"
-        $manifestEntries += Export-PackageViaWinget -Entry $entry -Id $id -DestFolder $destFolder
+        $manifestEntries += Export-PackageViaWinget -Entry $entry -Id $id -ExportRoot $ExportRoot -SkipExisting:$SkipExisting
     }
     else {
         Write-Host "---> Verarbeite Paket: $entry (Store-Produkt-ID: $id)"
-        $manifestEntries += Export-PackageViaStoreApi -Entry $entry -ProductId $id -DestFolder $destFolder
+        $manifestEntries += Export-PackageViaStoreApi -Entry $entry -ProductId $id -ExportRoot $ExportRoot -SkipExisting:$SkipExisting
     }
 }
 
