@@ -163,6 +163,57 @@ installiert alles per `Add-AppxPackage -AllUsers`.
 
 ## Hinweise
 
+### Was sind die ganzen Abhaengigkeiten im Dependencies-Ordner?
+
+Neben den Apps selbst tauchen im `Dependencies`-Unterordner meist ein paar
+immer wiederkehrende Pakete auf – das sind sogenannte **APPX-Framework-Pakete**:
+kein Bestandteil der jeweiligen App selbst, sondern gemeinsam genutzte
+Laufzeitbibliotheken, auf die mehrere Apps verweisen.
+
+| Framework-Paket | Wofuer |
+|---|---|
+| `Microsoft.VCLibs.140.00` | Visual-C++-Laufzeit (v14, VS 2015–2022) fuer UWP/MSIX-Apps |
+| `Microsoft.VCLibs.140.00.UWPDesktop` | Erweiterte VCLibs-Variante fuer "Desktop Bridge"-Apps (als MSIX verpackte klassische Win32-Anwendungen) |
+| `Microsoft.NET.Native.Runtime` / `Microsoft.NET.Native.Framework` | Laufzeit fuer aeltere UWP-Apps, die mit dem (mittlerweile veralteten) .NET-Native-AOT-Compiler gebaut wurden |
+| `Microsoft.WindowsAppRuntime` (1.x / 2.x) | Windows App SDK – Laufzeit fuer modernere Apps mit WinUI 3 (z. B. neuere Versionen von Paint, Fotos, Notepad) |
+| `Microsoft.UI.Xaml` (2.2 / 2.4 / 2.8 ...) | WinUI 2 – zusaetzliche/modernere XAML-Steuerelemente fuer UWP-Apps, unabhaengig vom XAML-Stand des jeweiligen Windows-Builds |
+
+### Konflikt mit bereits vorhandenen Paketen (z. B. durch Visual Studio 2026 + SDK)?
+
+**Nein.** Alle diese Framework-Pakete unterstuetzen laut offizieller
+Microsoft-Dokumentation ein **Side-by-Side-Servicing-Modell**: *"MSIX
+framework packages support servicing in a side-by-side model, meaning each
+version is installed in its own separate versioned folder."* Mehrere Versionen
+desselben Frameworks (z. B. `Microsoft.UI.Xaml.2.2` und `Microsoft.UI.Xaml.2.8`
+gleichzeitig) koennen also parallel installiert sein, ohne sich gegenseitig zu
+ersetzen oder zu stoeren – aehnlich wie WinSxS bei klassischen Win32-DLLs,
+nur eben fuer APPX-Pakete.
+
+Das ist genau der Grund, warum das bei Windows 11 mit parallel installiertem
+**Visual Studio 2026 + aktuellem Windows SDK** unproblematisch ist:
+
+- VS registriert bei aktivierten UWP-/WinUI-/Windows-App-SDK-Workloads
+  selbst bereits einige dieser Framework-Pakete auf dem Entwicklungsrechner
+  (fuer lokales Testen/Debuggen eigener Apps) – meist unter
+  `%ProgramFiles(x86)%\Microsoft SDKs\Windows Kits\10\ExtensionSDKs\...`.
+- Ist beim Import **exakt** die gleiche Version bereits registriert, erkennt
+  `Add-AppxPackage` das und tut schlicht nichts (kein Fehler, keine
+  Neuinstallation).
+- Wird eine **andere** Version benoetigt, installiert `Add-AppxPackage` diese
+  zusaetzlich, parallel zur von Visual Studio verwendeten Version. Beide
+  bleiben unabhaengig voneinander nutzbar; Visual Studios eigenes Tooling,
+  der Emulator/Debugger sowie eigene Projekte greifen weiterhin auf "ihre"
+  Version zu.
+- Das Betriebssystem entfernt eine Framework-Version erst automatisch, wenn
+  keine App (auch nicht Visual Studios eigene Testinstallationen) mehr eine
+  aktive Referenz darauf haelt.
+
+Kurz: Diese Pakete "ueberschreiben" oder "tangieren" nichts – sie ergaenzen
+lediglich das, was bereits vorhanden ist, um die jeweils exakt benoetigte
+Version.
+
+### Sonstiges
+
 - **Microsoft.VCLibs / Microsoft.NET.Native / Microsoft.UI.Xaml** als
   Abhaengigkeiten sind eigenstaendige APPX-Framework-Pakete und unabhaengig
   von einer klassisch installierten Visual-C++-Redistributable
