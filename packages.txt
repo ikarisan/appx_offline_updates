@@ -1,0 +1,9 @@
+Microsoft.MicrosoftStickyNotes	
+Microsoft.Paint	
+Microsoft.PowerAutomateDesktop	
+Microsoft.ScreenSketch	
+Microsoft.Todos	
+Microsoft.Windows.Photos	
+Microsoft.WindowsCalculator	
+Microsoft.WindowsNotepad	
+Microsoft.WindowsTerminal	
