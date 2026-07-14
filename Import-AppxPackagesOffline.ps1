@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
     Installiert zuvor exportierte APPX/MSIX-Pakete inkl. Abhaengigkeiten
-    systemweit (fuer alle bestehenden Benutzer) auf einem Air-Gapped
-    Zielsystem.
+    systemweit (fuer bestehende und zukuenftige Benutzer) auf einem
+    Air-Gapped Zielsystem.
 
 .DESCRIPTION
     Erwartet eine Ordnerstruktur wie von Export-AppxPackages.ps1 erzeugt:
@@ -10,6 +10,16 @@
     (.appx/.appxbundle/.msix/.msixbundle) und einem "Dependencies"-
     Unterordner. Optional wird vor der Installation die SHA256-Pruefsumme
     gegen das mitgelieferte Manifest (export-manifest.csv) verglichen.
+
+    WICHTIG: Add-AppxPackage installiert grundsaetzlich immer nur fuer das
+    aktuell angemeldete Benutzerkonto und besitzt keinen All-Users-Schalter.
+    Fuer eine echte systemweite Bereitstellung nutzt dieses Skript daher
+    Add-AppxProvisionedPackage -Online (DISM-Modul). Provisionierte Pakete
+    werden fuer bestehende Benutzer bei der naechsten Anmeldung automatisch
+    registriert, und fuer neu angelegte Benutzer ebenfalls automatisch.
+    Zusaetzlich installiert das Skript per einfachem Add-AppxPackage auch
+    sofort fuer die aktuell laufende (administrative) Sitzung, damit das
+    Ergebnis ohne Ab-/Anmelden ueberprueft werden kann.
 
 .PARAMETER SourceRoot
     Ordner mit den exportierten Paket-Unterordnern (auf das Air-Gapped
@@ -19,22 +29,37 @@
     Prueft vor der Installation die SHA256-Pruefsumme jeder Hauptpaketdatei
     gegen export-manifest.csv im SourceRoot. Empfohlen.
 
-.PARAMETER ProvisionForFutureUsers
-    Registriert das Paket zusaetzlich per Add-AppxProvisionedPackage, damit
-    es auch fuer zukuenftig neu angelegte lokale Benutzer verfuegbar ist.
-    Wirkt nur auf ein lebendes System (kein Sysprep-Generalize-Kontext).
+.PARAMETER SkipCurrentUserInstall
+    Ueberspringt die zusaetzliche sofortige Installation fuer die aktuell
+    angemeldete (administrative) Sitzung. Ohne diesen Schalter wird nach
+    der Provisionierung zusaetzlich ein einfacher Add-AppxPackage-Aufruf
+    fuer den aktuellen Benutzer ausgefuehrt.
 
 .PARAMETER Force
     Ueberspringt die Pruefung auf Windows PowerShell 5.1 (siehe Hinweis
     unten). Nur verwenden, wenn Sie das auf Ihrem PowerShell-7-Build
     getestet haben.
 
+.PARAMETER ForceApplicationShutdown
+    Beendet bei der Sofort-Installation fuer die aktuelle Sitzung laufende
+    Prozesse des betroffenen Pakets und erzwingt so das Update. Behebt den
+    Fehler HRESULT 0x80073D02 ("Das Paket konnte nicht installiert werden,
+    da die davon geaenderten Ressourcen derzeit verwendet werden" bzw.
+    "folgende Apps muessen geschlossen werden"), der auftritt, wenn eine
+    aeltere Version der App oder eine gemeinsam genutzte Framework-
+    Abhaengigkeit gerade laeuft. Achtung: laufende Apps werden ohne
+    Rueckfrage geschlossen.
+
+    Auch ohne diesen Schalter wiederholt das Skript die Sofort-Installation
+    bei genau diesem Fehler automatisch einmal mit -ForceApplicationShutdown.
+    Der Schalter erzwingt das Verhalten bereits beim ersten Versuch.
+
 .EXAMPLE
     .\Import-AppxPackagesOffline.ps1 -SourceRoot "D:\AppxImport" -VerifyHash
 
 .NOTES
-    Muss elevated (als Administrator) ausgefuehrt werden, da -AllUsers
-    verwendet wird.
+    Muss elevated (als Administrator) ausgefuehrt werden, da
+    Add-AppxProvisionedPackage -Online administrative Rechte erfordert.
 
     Muss in Windows PowerShell 5.1 laufen (powershell.exe), nicht in
     PowerShell 7 (pwsh.exe): Es gibt einen bekannten, gemeldeten Fehler, bei
@@ -54,11 +79,16 @@ param(
     [switch]$VerifyHash,
 
     [Parameter(Mandatory = $false)]
-    [switch]$ProvisionForFutureUsers,
+    [switch]$SkipCurrentUserInstall,
 
     [Parameter(Mandatory = $false)]
-    [switch]$Force
+    [switch]$Force,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceApplicationShutdown
 )
+
+Import-Module Dism -ErrorAction SilentlyContinue
 
 # --- Vorpruefung 1: Administratorrechte ---
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -66,7 +96,7 @@ $currentPrincipal = New-Object -TypeName Security.Principal.WindowsPrincipal -Ar
 $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if (-not $isAdmin) {
-    Write-Error "[FAIL] Dieses Skript muss als Administrator ausgefuehrt werden (-AllUsers erfordert Elevation)."
+    Write-Error "[FAIL] Dieses Skript muss als Administrator ausgefuehrt werden (Add-AppxProvisionedPackage -Online erfordert Elevation)."
     exit 1
 }
 
@@ -162,33 +192,72 @@ foreach ($folder in $appFolders) {
     }
 
     try {
+        # Primaerer Weg fuer "systemweit": DISM-Provisionierung. Wirkt fuer
+        # bestehende Benutzer ab der naechsten Anmeldung und automatisch
+        # fuer jeden neu angelegten Benutzer.
         if ($depFiles.Count -gt 0) {
-            Add-AppxPackage -Path $mainFile.FullName -DependencyPath $depFiles.FullName -AllUsers -ErrorAction Stop
+            Add-AppxProvisionedPackage -Online -PackagePath $mainFile.FullName -DependencyPackagePath $depFiles.FullName -SkipLicense -ErrorAction Stop | Out-Null
         }
         else {
-            Add-AppxPackage -Path $mainFile.FullName -AllUsers -ErrorAction Stop
+            Add-AppxProvisionedPackage -Online -PackagePath $mainFile.FullName -SkipLicense -ErrorAction Stop | Out-Null
         }
 
-        Write-Host "[OK] Installiert (bestehende Benutzer): $($mainFile.Name)"
-        $results += [PSCustomObject]@{ Folder = $folder.Name; Status = "OK"; Detail = "Installiert fuer bestehende Benutzer" }
+        Write-Host "[OK] Systemweit provisioniert: $($mainFile.Name) (bestehende Benutzer ab naechster Anmeldung, neue Benutzer automatisch)"
+        $status = "OK"
+        $detail = "Provisioniert per Add-AppxProvisionedPackage"
 
-        if ($ProvisionForFutureUsers) {
-            try {
+        # Zusaetzlich sofort fuer die aktuelle (administrative) Sitzung installieren,
+        # damit das Ergebnis ohne Ab-/Anmelden getestet werden kann
+        if (-not $SkipCurrentUserInstall) {
+            # Lokale Funktion fuer den eigentlichen Installationsversuch. -force
+            # steuert, ob -ForceApplicationShutdown gesetzt wird (beendet laufende
+            # Prozesse des Pakets, behebt HRESULT 0x80073D02).
+            $installCurrentSession = {
+                param([bool]$UseForceShutdown)
+                $addAppxParams = @{ ErrorAction = "Stop" }
+                if ($UseForceShutdown) {
+                    $addAppxParams["ForceApplicationShutdown"] = $true
+                }
                 if ($depFiles.Count -gt 0) {
-                    Add-AppxProvisionedPackage -Online -PackagePath $mainFile.FullName -DependencyPackagePath $depFiles.FullName -SkipLicense -ErrorAction Stop | Out-Null
+                    Add-AppxPackage -Path $mainFile.FullName -DependencyPath $depFiles.FullName @addAppxParams
                 }
                 else {
-                    Add-AppxProvisionedPackage -Online -PackagePath $mainFile.FullName -SkipLicense -ErrorAction Stop | Out-Null
+                    Add-AppxPackage -Path $mainFile.FullName @addAppxParams
                 }
-                Write-Host "[OK] Zusaetzlich fuer zukuenftige Benutzer provisioniert: $($mainFile.Name)"
+            }
+
+            try {
+                & $installCurrentSession $ForceApplicationShutdown.IsPresent
+                Write-Host "[OK] Zusaetzlich sofort fuer aktuelle Sitzung installiert: $($mainFile.Name)"
+                $detail += "; sofort fuer aktuelle Sitzung installiert"
             }
             catch {
-                Write-Warning "[WARN] Provisionierung fuer zukuenftige Benutzer fehlgeschlagen: $($_.Exception.Message)"
+                # 0x80073D02: Ressourcen/Prozesse des Pakets in Verwendung. Wurde noch
+                # nicht mit erzwungenem Shutdown versucht -> genau einmal wiederholen.
+                $isInUseError = $_.Exception.Message -match "0x80073D02"
+                if ($isInUseError -and -not $ForceApplicationShutdown) {
+                    Write-Warning "[WARN] $($mainFile.Name): App/Ressourcen in Verwendung (0x80073D02). Wiederhole mit erzwungenem Beenden laufender Prozesse..."
+                    try {
+                        & $installCurrentSession $true
+                        Write-Host "[OK] Nach erzwungenem Beenden sofort fuer aktuelle Sitzung installiert: $($mainFile.Name)"
+                        $detail += "; sofort fuer aktuelle Sitzung installiert (nach ForceApplicationShutdown)"
+                    }
+                    catch {
+                        Write-Warning "[WARN] Sofort-Installation auch mit ForceApplicationShutdown fehlgeschlagen (Provisionierung ist trotzdem aktiv): $($_.Exception.Message)"
+                        $detail += "; Sofort-Installation fehlgeschlagen (auch mit ForceApplicationShutdown): $($_.Exception.Message)"
+                    }
+                }
+                else {
+                    Write-Warning "[WARN] Sofort-Installation fuer aktuelle Sitzung fehlgeschlagen (Provisionierung ist trotzdem aktiv): $($_.Exception.Message)"
+                    $detail += "; Sofort-Installation fuer aktuelle Sitzung fehlgeschlagen: $($_.Exception.Message)"
+                }
             }
         }
+
+        $results += [PSCustomObject]@{ Folder = $folder.Name; Status = $status; Detail = $detail }
     }
     catch {
-        Write-Warning "[FAIL] Installation fehlgeschlagen fuer $($mainFile.Name): $($_.Exception.Message)"
+        Write-Warning "[FAIL] Provisionierung fehlgeschlagen fuer $($mainFile.Name): $($_.Exception.Message)"
         $results += [PSCustomObject]@{ Folder = $folder.Name; Status = "FAIL"; Detail = $_.Exception.Message }
     }
 }
@@ -197,7 +266,7 @@ Write-Host ""
 Write-Host "---> Zusammenfassung:"
 $results | Format-Table -AutoSize
 
-$failCount = @($results | Where-Object Status -eq "FAIL").Count
+$failCount = ($results | Where-Object Status -eq "FAIL").Count
 if ($failCount -gt 0) {
     Write-Warning "$failCount Paket(e) konnten nicht installiert werden. Details siehe obige Tabelle."
     exit 1

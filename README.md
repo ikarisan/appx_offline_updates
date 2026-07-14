@@ -70,25 +70,28 @@ muessen. Erkennt automatisch zwei Arten von Paket-Bezeichnern:
 
 Pro Paket entsteht unter `-ExportRoot` ein Unterordner, benannt nach dem
 Appx-Paketnamen (z. B. `Microsoft.WindowsCalculator`, nicht nach der
-Store-ID):
+Store-ID). Alle Abhaengigkeiten liegen paketübergreifend und ohne Duplikate
+in einem einzigen `Dependencies`-Ordner direkt unter `-ExportRoot`:
 
 ```
 AppxExport/
 ├── export-manifest.csv
+├── Dependencies/
+│   ├── Microsoft.UI.Xaml.2.8_..._x64....msix
+│   ├── Microsoft.VCLibs.140.00_..._x64....msix
+│   └── ...
 ├── Microsoft.WindowsCalculator/
-│   ├── Microsoft.WindowsCalculator_2021.2605.9.0_neutral_~_8wekyb3d8bbwe.msixbundle
-│   └── Dependencies/
-│       ├── Microsoft.UI.Xaml.2.8_..._x64....msix
-│       ├── Microsoft.VCLibs.140.00_..._x64....msix
-│       └── ...
+│   └── Microsoft.WindowsCalculator_2021.2605.9.0_neutral_~_8wekyb3d8bbwe.msixbundle
 └── Microsoft.WindowsTerminal/
-    ├── Windows Terminal_..._x64....msix
-    └── Dependencies/
-        └── Microsoft.UI.Xaml_..._x64....msix
+    └── Windows Terminal_..._x64....msix
 ```
 
-`export-manifest.csv` enthaelt pro Paket Status, Version, Hauptdatei und
-SHA256-Hash – wird von `Import-AppxPackagesOffline.ps1 -VerifyHash` genutzt.
+`export-manifest.csv` enthaelt pro Paket Status, Version, Hauptdatei,
+SHA256-Hash und in der Spalte `Dependencies` die Liste der von diesem Paket
+tatsaechlich benoetigten Abhaengigkeitsdateien (mehrere durch `;` getrennt).
+Sie wird von `Import-AppxPackagesOffline.ps1` genutzt, um pro Paket genau
+diese – und nur diese – Abhaengigkeiten per `-DependencyPath` zu installieren
+(sowie bei `-VerifyHash` fuer die SHA256-Pruefung).
 
 ---
 
@@ -156,8 +159,12 @@ systemweit (fuer alle bestehenden Benutzer) auf dem Air-Gapped Zielsystem.
 
 Das Skript durchsucht `-SourceRoot` nach Unterordnern, findet darin jeweils
 die Hauptpaketdatei (`.msixbundle`/`.appxbundle` bevorzugt, sonst
-`.msix`/`.appx`) sowie die Abhaengigkeiten im `Dependencies`-Unterordner und
-installiert alles per `Add-AppxPackage -AllUsers`.
+`.msix`/`.appx`) und ermittelt aus der Spalte `Dependencies` des Manifests,
+welche Dateien aus dem gemeinsamen `Dependencies`-Ordner das Paket benoetigt.
+Installiert wird per `Add-AppxPackage -AllUsers -DependencyPath` mit genau
+diesen Abhaengigkeiten. Fehlt das Manifest, wird aus Rueckwaerts-
+Kompatibilitaet auf einen paket-eigenen `Dependencies`-Unterordner
+zurueckgegriffen (altes Layout).
 
 ---
 
@@ -165,7 +172,7 @@ installiert alles per `Add-AppxPackage -AllUsers`.
 
 ### Was sind die ganzen Abhaengigkeiten im Dependencies-Ordner?
 
-Neben den Apps selbst tauchen im `Dependencies`-Unterordner meist ein paar
+Neben den Apps selbst tauchen im gemeinsamen `Dependencies`-Ordner meist ein paar
 immer wiederkehrende Pakete auf – das sind sogenannte **APPX-Framework-Pakete**:
 kein Bestandteil der jeweiligen App selbst, sondern gemeinsam genutzte
 Laufzeitbibliotheken, auf die mehrere Apps verweisen.

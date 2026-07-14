@@ -27,13 +27,17 @@
        da nicht ueber den Microsoft Store lizenziert).
 
     Pro Paket wird ein eigener Unterordner mit der Hauptpaketdatei
-    (.msix/.msixbundle) und einem "Dependencies"-Unterordner (exakt die
-    laut Paketmanifest benoetigten Abhaengigkeiten) angelegt. Der
-    Unterordner wird nach dem Appx-Paketnamen benannt (z. B.
-    "Microsoft.WindowsCalculator"), nicht nach der Store-Produkt-ID oder
-    dem urspruenglich angegebenen Bezeichner. Zusaetzlich wird ein
-    Manifest (export-manifest.csv) mit SHA256-Hashes geschrieben,
-    kompatibel mit Import-AppxPackagesOffline.ps1 -VerifyHash.
+    (.msix/.msixbundle) angelegt und nach dem Appx-Paketnamen benannt
+    (z. B. "Microsoft.WindowsCalculator"), nicht nach der Store-Produkt-ID
+    oder dem urspruenglich angegebenen Bezeichner. Alle Abhaengigkeiten
+    werden - ueber alle Pakete hinweg gemeinsam und ohne Duplikate - in
+    einem einzigen "Dependencies"-Ordner direkt unterhalb von -ExportRoot
+    abgelegt. Zusaetzlich wird ein Manifest (export-manifest.csv) mit
+    SHA256-Hashes und - je Paket - der Liste der tatsaechlich benoetigten
+    Abhaengigkeitsdateien (Spalte "Dependencies", mehrere durch ";"
+    getrennt) geschrieben. Dadurch installiert
+    Import-AppxPackagesOffline.ps1 pro Paket ausschliesslich die wirklich
+    benoetigten Abhaengigkeiten.
 
 .PARAMETER PackageNames
     Ein oder mehrere Paket-Bezeichner (Store-Produkt-ID, Store-Link oder
@@ -127,6 +131,7 @@ $script:MachineArch = switch ($env:PROCESSOR_ARCHITECTURE) {
     default { "x64" }
 }
 $script:WuCookie = $null
+$script:ProcessedDepMonikers = @{}
 
 function Resolve-PackageIdentifier {
     param([string]$Entry)
@@ -141,7 +146,7 @@ function Resolve-PackageIdentifier {
 }
 
 function New-ManifestEntry {
-    param($PackageName, $Status, $Detail, $Version, $ExportPath, $MainFile, $SHA256)
+    param($PackageName, $Status, $Detail, $Version, $ExportPath, $MainFile, $SHA256, $Dependencies)
     [PSCustomObject]@{
         PackageName   = $PackageName
         Status        = $Status
@@ -150,8 +155,37 @@ function New-ManifestEntry {
         ExportPath    = $ExportPath
         MainFile      = $MainFile
         SHA256        = $SHA256
+        Dependencies  = if ($Dependencies) { (@($Dependencies) -join ";") } else { "" }
         ExportedAtUtc = (Get-Date).ToUniversalTime().ToString("s")
     }
+}
+
+function Move-DependenciesToShared {
+    <#
+        Verschiebt Abhaengigkeits-Paketdateien in den gemeinsamen
+        "Dependencies"-Ordner unterhalb von -ExportRoot und gibt die Liste
+        der Dateinamen zurueck. Ist eine Datei dort bereits vorhanden (von
+        einem anderen Paket), wird das Duplikat verworfen statt erneut
+        abgelegt.
+    #>
+    param($CandidateFiles, [string]$ExportRoot)
+
+    $collected = @()
+    $sharedDepFolder = Join-Path -Path $ExportRoot -ChildPath "Dependencies"
+    foreach ($file in @($CandidateFiles)) {
+        if (-not (Test-Path -Path $sharedDepFolder)) {
+            New-Item -Path $sharedDepFolder -ItemType Directory -Force | Out-Null
+        }
+        $target = Join-Path -Path $sharedDepFolder -ChildPath $file.Name
+        if (Test-Path -Path $target) {
+            Remove-Item -Path $file.FullName -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Move-Item -Path $file.FullName -Destination $target -Force
+        }
+        $collected += $file.Name
+    }
+    return @($collected | Select-Object -Unique)
 }
 
 function Compare-AppxVersion {
@@ -232,12 +266,19 @@ function Export-PackageViaWinget {
             throw "Keine .msixbundle/.appxbundle/.msix/.appx Datei nach dem Download gefunden."
         }
 
+        # Von winget zusaetzlich heruntergeladene Paketdateien sind Abhaengigkeiten.
+        # Diese in den gemeinsamen Dependencies-Ordner auf ExportRoot-Ebene verschieben,
+        # damit sie nicht pro Paket redundant abgelegt werden.
+        $depCandidateFiles = Get-ChildItem -Path $DestFolder -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -ne $mainFile.FullName -and $_.Extension -in ".appx", ".msix", ".appxbundle", ".msixbundle" }
+        $collectedDeps = Move-DependenciesToShared -CandidateFiles $depCandidateFiles -ExportRoot $ExportRoot
+
         $hash = Get-FileHash -Path $mainFile.FullName -Algorithm SHA256
         $version = $null
         if ($mainFile.BaseName -match "_(\d+(?:\.\d+){1,3})_") { $version = $Matches[1] }
 
         Write-Host "[OK] Heruntergeladen (winget): $($mainFile.Name)"
-        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "" -Version $version -ExportPath $DestFolder -MainFile $mainFile.Name -SHA256 $hash.Hash
+        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "" -Version $version -ExportPath $DestFolder -MainFile $mainFile.Name -SHA256 $hash.Hash -Dependencies $collectedDeps
     }
     catch {
         Write-Warning "[FAIL] winget download fehlgeschlagen fuer '$Entry': $($_.Exception.Message)"
@@ -515,20 +556,34 @@ function Export-PackageViaStoreApi {
             Write-Host "[OK] Hauptpaket heruntergeladen: $mainFileName"
         }
 
-        $depFolder = Join-Path -Path $DestFolder -ChildPath "Dependencies"
-        if ($packageInfo.DependencyNames.Count -gt 0) {
+        # Abhaengigkeiten liegen gemeinsam auf ExportRoot-Ebene (nicht pro Paket redundant).
+        $depFolder = Join-Path -Path $ExportRoot -ChildPath "Dependencies"
+        if ($packageInfo.DependencyNames.Count -gt 0 -and -not (Test-Path -Path $depFolder)) {
             New-Item -Path $depFolder -ItemType Directory -Force | Out-Null
         }
+        $collectedDeps = @()
         foreach ($depName in $packageInfo.DependencyNames) {
             $depCandidate = Select-BestCandidate -Candidates $candidates -Name $depName
             if (-not $depCandidate) {
                 Write-Warning "    [WARN] Abhaengigkeit '$depName' wurde in den Sync-Ergebnissen nicht gefunden, wird uebersprungen."
                 continue
             }
-            $depUrls = @(Get-WuFileUrls -UpdateId $depCandidate.UpdateId -RevisionId $depCandidate.RevisionId)
             $existingDep = Get-ExistingFileForMoniker -Folder $depFolder -Moniker $depCandidate.Moniker
+
+            # Bereits in diesem Lauf sichergestellte Abhaengigkeit nicht erneut laden
+            # (verhindert redundante Downloads, wenn mehrere Pakete dieselbe
+            # Abhaengigkeit benoetigen).
+            if ($existingDep -and $script:ProcessedDepMonikers.ContainsKey($depCandidate.Moniker)) {
+                Write-Host "    [SKIP] Abhaengigkeit bereits im gemeinsamen Ordner vorhanden: $($existingDep.Name)"
+                $collectedDeps += $existingDep.Name
+                continue
+            }
+
+            $depUrls = @(Get-WuFileUrls -UpdateId $depCandidate.UpdateId -RevisionId $depCandidate.RevisionId)
             if ($SkipExisting -and $existingDep -and $depUrls.Count -gt 0 -and (Test-RemoteSizeMatchesLocal -Url $depUrls[0] -LocalSize $existingDep.Length)) {
                 Write-Host "    [SKIP] Abhaengigkeit bereits vorhanden (gleiche Version/Groesse): $($existingDep.Name)"
+                $script:ProcessedDepMonikers[$depCandidate.Moniker] = $true
+                $collectedDeps += $existingDep.Name
                 continue
             }
             foreach ($depUrl in $depUrls) {
@@ -538,11 +593,14 @@ function Export-PackageViaStoreApi {
                 $depFileName = "$($depCandidate.Moniker)$($depInfo.Extension)"
                 Move-Item -Path $tempDepPath -Destination (Join-Path $depFolder $depFileName) -Force
                 Write-Host "    Abhaengigkeit heruntergeladen: $depFileName"
+                $collectedDeps += $depFileName
             }
+            $script:ProcessedDepMonikers[$depCandidate.Moniker] = $true
         }
+        $collectedDeps = @($collectedDeps | Select-Object -Unique)
 
         $hash = Get-FileHash -Path $mainFilePath -Algorithm SHA256
-        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "" -Version $main.Version -ExportPath $DestFolder -MainFile $mainFileName -SHA256 $hash.Hash
+        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "" -Version $main.Version -ExportPath $DestFolder -MainFile $mainFileName -SHA256 $hash.Hash -Dependencies $collectedDeps
     }
     catch {
         Write-Warning "[FAIL] Store-API-Download fehlgeschlagen fuer '$Entry': $($_.Exception.Message)"
