@@ -7,9 +7,14 @@
 .DESCRIPTION
     Erwartet eine Ordnerstruktur wie von Export-AppxPackages.ps1 erzeugt:
     pro Paket ein Unterordner mit genau einer Hauptpaketdatei
-    (.appx/.appxbundle/.msix/.msixbundle) und einem "Dependencies"-
-    Unterordner. Optional wird vor der Installation die SHA256-Pruefsumme
-    gegen das mitgelieferte Manifest (export-manifest.csv) verglichen.
+    (.appx/.appxbundle/.msix/.msixbundle) sowie ein gemeinsamer
+    "Dependencies"-Ordner direkt unter -SourceRoot. Welche Abhaengigkeits-
+    Dateien ein Paket tatsaechlich benoetigt, wird aus der Spalte
+    "Dependencies" von export-manifest.csv gelesen. Fehlt das Manifest oder
+    die Spalte, wird aus Rueckwaerts-Kompatibilitaet auf einen
+    paket-eigenen "Dependencies"-Unterordner zurueckgegriffen (altes
+    Layout). Optional wird vor der Installation zusaetzlich die
+    SHA256-Pruefsumme gegen das Manifest verglichen.
 
     WICHTIG: Add-AppxPackage installiert grundsaetzlich immer nur fuer das
     aktuell angemeldete Benutzerkonto und besitzt keinen All-Users-Schalter.
@@ -113,17 +118,15 @@ if (-not (Test-Path -Path $SourceRoot)) {
     exit 1
 }
 
-# --- Optional: Manifest fuer Hash-Pruefung laden ---
+# --- Manifest laden (fuer Hash-Pruefung UND Abhaengigkeits-Aufloesung) ---
+$manifestPath = Join-Path -Path $SourceRoot -ChildPath "export-manifest.csv"
 $manifest = $null
-if ($VerifyHash) {
-    $manifestPath = Join-Path -Path $SourceRoot -ChildPath "export-manifest.csv"
-    if (Test-Path -Path $manifestPath) {
-        $manifest = Import-Csv -Path $manifestPath
-    }
-    else {
-        Write-Warning "[WARN] -VerifyHash gesetzt, aber export-manifest.csv nicht gefunden unter: $manifestPath"
-        Write-Warning "Fahre ohne Hash-Pruefung fort."
-    }
+if (Test-Path -Path $manifestPath) {
+    $manifest = Import-Csv -Path $manifestPath
+}
+elseif ($VerifyHash) {
+    Write-Warning "[WARN] -VerifyHash gesetzt, aber export-manifest.csv nicht gefunden unter: $manifestPath"
+    Write-Warning "Fahre ohne Hash-Pruefung fort."
 }
 
 $results = @()
@@ -156,14 +159,21 @@ foreach ($folder in $appFolders) {
         continue
     }
 
+    # Manifest-Eintrag fuer dieses Paket ermitteln (wird sowohl fuer -VerifyHash
+    # als auch fuer die Abhaengigkeits-Aufloesung ueber die "Dependencies"-Spalte
+    # benoetigt).
+    $manifestEntry = $null
+    if ($manifest) {
+        $manifestEntry = $manifest | Where-Object { $_.MainFile -eq $mainFile.Name -and $_.Status -eq "OK" } | Select-Object -First 1
+    }
+
     # Optional: Hash gegen Manifest pruefen
     if ($VerifyHash -and $manifest) {
-        $entry = $manifest | Where-Object { $_.MainFile -eq $mainFile.Name -and $_.Status -eq "OK" }
-        if ($entry) {
+        if ($manifestEntry) {
             $actualHash = (Get-FileHash -Path $mainFile.FullName -Algorithm SHA256).Hash
-            if ($actualHash -ne $entry.SHA256) {
+            if ($actualHash -ne $manifestEntry.SHA256) {
                 Write-Warning "[FAIL] SHA256 stimmt nicht mit dem Manifest ueberein: $($mainFile.Name)"
-                Write-Warning "       Erwartet: $($entry.SHA256)"
+                Write-Warning "       Erwartet: $($manifestEntry.SHA256)"
                 Write-Warning "       Ist:      $actualHash"
                 $results += [PSCustomObject]@{ Folder = $folder.Name; Status = "FAIL"; Detail = "Hash-Abweichung, Installation uebersprungen" }
                 continue
@@ -177,19 +187,39 @@ foreach ($folder in $appFolders) {
         }
     }
 
-    # Abhaengigkeiten sammeln (mehrere Wildcard-Pfade statt -Include, da -Include
-    # nur zuverlaessig greift, wenn Path selbst bereits ein Wildcard-Element enthaelt)
-    $depFolder = Join-Path -Path $folder.FullName -ChildPath "Dependencies"
+    # Abhaengigkeiten aufloesen: bevorzugt ueber die "Dependencies"-Spalte des
+    # Manifests (verweist auf Dateien im gemeinsamen SourceRoot\Dependencies-
+    # Ordner, aktuelles Export-Layout). Fallback auf einen paket-eigenen
+    # <Paketordner>\Dependencies-Unterordner (altes Layout / kein Manifest).
+    $sharedDepFolder = Join-Path -Path $SourceRoot -ChildPath "Dependencies"
     $depFiles = @()
-    if (Test-Path -Path $depFolder) {
-        $depPatterns = @(
-            (Join-Path $depFolder "*.appx"),
-            (Join-Path $depFolder "*.msix"),
-            (Join-Path $depFolder "*.msixbundle"),
-            (Join-Path $depFolder "*.appxbundle")
-        )
-        $depFiles = @(Get-ChildItem -Path $depPatterns -File -ErrorAction SilentlyContinue)
+    if ($manifestEntry -and $manifestEntry.Dependencies) {
+        $depFileNames = $manifestEntry.Dependencies -split ";" | Where-Object { $_ }
+        foreach ($depFileName in $depFileNames) {
+            $depPath = Join-Path -Path $sharedDepFolder -ChildPath $depFileName
+            if (Test-Path -Path $depPath) {
+                $depFiles += Get-Item -Path $depPath
+            }
+            else {
+                Write-Warning "[WARN] Im Manifest referenzierte Abhaengigkeit nicht gefunden: $depPath"
+            }
+        }
     }
+    else {
+        # Mehrere Wildcard-Pfade statt -Include, da -Include nur zuverlaessig
+        # greift, wenn Path selbst bereits ein Wildcard-Element enthaelt.
+        $depFolder = Join-Path -Path $folder.FullName -ChildPath "Dependencies"
+        if (Test-Path -Path $depFolder) {
+            $depPatterns = @(
+                (Join-Path $depFolder "*.appx"),
+                (Join-Path $depFolder "*.msix"),
+                (Join-Path $depFolder "*.msixbundle"),
+                (Join-Path $depFolder "*.appxbundle")
+            )
+            $depFiles = @(Get-ChildItem -Path $depPatterns -File -ErrorAction SilentlyContinue)
+        }
+    }
+    $depFiles = @($depFiles)
 
     try {
         # Primaerer Weg fuer "systemweit": DISM-Provisionierung. Wirkt fuer
@@ -266,7 +296,7 @@ Write-Host ""
 Write-Host "---> Zusammenfassung:"
 $results | Format-Table -AutoSize
 
-$failCount = ($results | Where-Object Status -eq "FAIL").Count
+$failCount = @($results | Where-Object Status -eq "FAIL").Count
 if ($failCount -gt 0) {
     Write-Warning "$failCount Paket(e) konnten nicht installiert werden. Details siehe obige Tabelle."
     exit 1
