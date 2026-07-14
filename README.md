@@ -128,11 +128,29 @@ Microsoft.WindowsTerminal
 ## 3. Import-AppxPackagesOffline.ps1
 
 Installiert die von `Export-AppxPackages.ps1` heruntergeladenen Pakete
-systemweit (fuer alle bestehenden Benutzer) auf dem Air-Gapped Zielsystem.
+systemweit (fuer bestehende und zukuenftige Benutzer) auf dem Air-Gapped
+Zielsystem.
+
+`Add-AppxPackage` installiert grundsaetzlich nur fuer das aktuell angemeldete
+Benutzerkonto und kennt keinen echten All-Users-Schalter. Fuer eine
+tatsaechlich systemweite Bereitstellung nutzt das Skript daher primaer
+`Add-AppxProvisionedPackage -Online` (DISM): bestehende Benutzer erhalten das
+Paket automatisch bei der naechsten Anmeldung, neu angelegte Benutzer
+ebenfalls automatisch. Zusaetzlich installiert das Skript per einfachem
+`Add-AppxPackage` sofort fuer die aktuell laufende (administrative) Sitzung,
+damit das Ergebnis ohne Ab-/Anmelden sichtbar ist.
+
+Da beide Schritte ohne Fehler zurueckkehren koennen, ohne dass das Paket
+fuer die aktuelle Sitzung wirklich nutzbar ist (z. B. wenn es fuer den
+aktuellen Benutzer nur als "Staged" statt "Installed" registriert wurde),
+verifiziert das Skript den tatsaechlichen Zustand anschliessend per
+`Get-AppxProvisionedPackage` bzw. `Get-AppxPackage`. Kann das nicht bestaetigt
+werden, erscheint in der Ergebnistabelle der Status `WARN` statt `OK`
+(Detail-Spalte nennt den Grund, meist "Ab-/Neuanmeldung noetig").
 
 ### Voraussetzungen
 
-- Muss **als Administrator** ausgefuehrt werden (`-AllUsers` erfordert Elevation).
+- Muss **als Administrator** ausgefuehrt werden (`Add-AppxProvisionedPackage -Online` erfordert Elevation).
 - Muss in **Windows PowerShell 5.1** laufen (`powershell.exe`), nicht in
   PowerShell 7 (`pwsh.exe`) – in PowerShell 7 gibt es einen bekannten Fehler,
   bei dem `-DependencyPath` fehlerhaft verarbeitet wird. Das Skript bricht
@@ -144,8 +162,11 @@ systemweit (fuer alle bestehenden Benutzer) auf dem Air-Gapped Zielsystem.
 # Empfohlen: mit Hash-Pruefung gegen export-manifest.csv
 .\Import-AppxPackagesOffline.ps1 -SourceRoot "D:\AppxExport" -VerifyHash
 
-# Zusaetzlich fuer zukuenftig neu angelegte Benutzer bereitstellen
-.\Import-AppxPackagesOffline.ps1 -SourceRoot "D:\AppxExport" -VerifyHash -ProvisionForFutureUsers
+# Nur provisionieren, ohne sofortige Installation fuer die aktuelle Sitzung
+.\Import-AppxPackagesOffline.ps1 -SourceRoot "D:\AppxExport" -SkipCurrentUserInstall
+
+# Laufende Prozesse des Pakets beim Sofort-Update sofort beenden (0x80073D02)
+.\Import-AppxPackagesOffline.ps1 -SourceRoot "D:\AppxExport" -ForceApplicationShutdown
 ```
 
 ### Parameter
@@ -154,15 +175,16 @@ systemweit (fuer alle bestehenden Benutzer) auf dem Air-Gapped Zielsystem.
 |---|---|
 | `-SourceRoot` | Ordner mit den exportierten Paket-Unterordnern (z. B. der per USB uebertragene `AppxExport`-Ordner). |
 | `-VerifyHash` | Prueft vor der Installation die SHA256-Pruefsumme jeder Hauptpaketdatei gegen `export-manifest.csv`. Empfohlen. |
-| `-ProvisionForFutureUsers` | Registriert das Paket zusaetzlich per `Add-AppxProvisionedPackage`, damit es auch fuer erst spaeter angelegte Benutzerkonten verfuegbar ist. |
+| `-SkipCurrentUserInstall` | Ueberspringt die zusaetzliche sofortige `Add-AppxPackage`-Installation fuer die aktuelle Sitzung; es wird nur provisioniert. |
+| `-ForceApplicationShutdown` | Beendet bei der Sofort-Installation laufende Prozesse des Pakets, um HRESULT 0x80073D02 ("Ressourcen werden verwendet") zu beheben. Ohne diesen Schalter wiederholt das Skript bei genau diesem Fehler die Sofort-Installation automatisch einmal mit erzwungenem Beenden. |
 | `-Force` | Ueberspringt die PowerShell-5.1-Pruefung (nur verwenden, wenn unter PowerShell 7 getestet). |
 
 Das Skript durchsucht `-SourceRoot` nach Unterordnern, findet darin jeweils
 die Hauptpaketdatei (`.msixbundle`/`.appxbundle` bevorzugt, sonst
 `.msix`/`.appx`) und ermittelt aus der Spalte `Dependencies` des Manifests,
 welche Dateien aus dem gemeinsamen `Dependencies`-Ordner das Paket benoetigt.
-Installiert wird per `Add-AppxPackage -AllUsers -DependencyPath` mit genau
-diesen Abhaengigkeiten. Fehlt das Manifest, wird aus Rueckwaerts-
+Installiert wird per `Add-AppxProvisionedPackage -DependencyPackagePath` mit
+genau diesen Abhaengigkeiten. Fehlt das Manifest, wird aus Rueckwaerts-
 Kompatibilitaet auf einen paket-eigenen `Dependencies`-Unterordner
 zurueckgegriffen (altes Layout).
 

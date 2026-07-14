@@ -26,6 +26,16 @@
     sofort fuer die aktuell laufende (administrative) Sitzung, damit das
     Ergebnis ohne Ab-/Anmelden ueberprueft werden kann.
 
+    Sowohl Add-AppxProvisionedPackage als auch Add-AppxPackage koennen ohne
+    Fehler zurueckkehren, ohne dass das Paket fuer die aktuelle Sitzung
+    tatsaechlich nutzbar ist (z. B. weil es fuer den aktuellen Benutzer nur
+    als "Staged" statt "Installed" registriert wurde und erst bei der
+    naechsten Anmeldung aktiv wird). Das Skript verifiziert deshalb nach
+    beiden Schritten per Get-AppxProvisionedPackage bzw. Get-AppxPackage, ob
+    das Paket wirklich (a) provisioniert und (b) fuer die aktuelle Sitzung
+    installiert ist, und meldet den Status "WARN" statt "OK", wenn das nicht
+    bestaetigt werden kann (siehe Detail-Spalte fuer den genauen Grund).
+
 .PARAMETER SourceRoot
     Ordner mit den exportierten Paket-Unterordnern (auf das Air-Gapped
     System uebertragen, z. B. per USB).
@@ -232,9 +242,22 @@ foreach ($folder in $appFolders) {
             Add-AppxProvisionedPackage -Online -PackagePath $mainFile.FullName -SkipLicense -ErrorAction Stop | Out-Null
         }
 
-        Write-Host "[OK] Systemweit provisioniert: $($mainFile.Name) (bestehende Benutzer ab naechster Anmeldung, neue Benutzer automatisch)"
-        $status = "OK"
-        $detail = "Provisioniert per Add-AppxProvisionedPackage"
+        # Verifikation: DISM kann Erfolg melden, ohne dass ein Eintrag in
+        # Get-AppxProvisionedPackage auftaucht (seltener Randfall) - lieber
+        # ehrlich als "WARN" statt ungeprueft "OK" melden.
+        $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.PackageName -like "$($folder.Name)_*" }
+
+        if ($provisioned) {
+            Write-Host "[OK] Systemweit provisioniert (verifiziert): $($mainFile.Name) -> $($provisioned.PackageName) (bestehende Benutzer ab naechster Anmeldung, neue Benutzer automatisch)"
+            $status = "OK"
+            $detail = "Provisioniert und verifiziert per Get-AppxProvisionedPackage"
+        }
+        else {
+            Write-Warning "[WARN] Add-AppxProvisionedPackage meldete Erfolg, aber '$($folder.Name)' erscheint nicht in Get-AppxProvisionedPackage."
+            $status = "WARN"
+            $detail = "Provisionierung meldete Erfolg, konnte aber nicht per Get-AppxProvisionedPackage verifiziert werden"
+        }
 
         # Zusaetzlich sofort fuer die aktuelle (administrative) Sitzung installieren,
         # damit das Ergebnis ohne Ab-/Anmelden getestet werden kann
@@ -282,6 +305,35 @@ foreach ($folder in $appFolders) {
                     $detail += "; Sofort-Installation fuer aktuelle Sitzung fehlgeschlagen: $($_.Exception.Message)"
                 }
             }
+
+            # Verifikation: Add-AppxPackage kann ohne Fehler zurueckkehren, obwohl
+            # das Paket fuer den aktuellen Benutzer nur als "Staged" (statt
+            # "Installed") registriert wurde und erst bei der naechsten Anmeldung
+            # wirklich verfuegbar ist. Deshalb den tatsaechlichen Zustand ueber
+            # PackageUserInformation der aktuell angemeldeten SID pruefen.
+            $currentSid = $currentIdentity.User.Value
+            $installedPkg = Get-AppxPackage -AllUsers -Name $folder.Name -ErrorAction SilentlyContinue
+            $currentUserEntry = $null
+            if ($installedPkg) {
+                $currentUserEntry = $installedPkg.PackageUserInformation |
+                    Where-Object { $_.UserSecurityId.ToString() -like "$currentSid*" } |
+                    Select-Object -First 1
+            }
+
+            if ($currentUserEntry -and $currentUserEntry.InstallState -eq "Installed") {
+                Write-Host "[OK] Verifiziert: '$($folder.Name)' ist fuer die aktuelle Sitzung installiert."
+                $detail += "; verifiziert: fuer aktuelle Sitzung installiert"
+            }
+            elseif ($currentUserEntry -and $currentUserEntry.InstallState -eq "Staged") {
+                Write-Warning "[WARN] '$($folder.Name)' ist fuer die aktuelle Sitzung nur 'Staged' - wird erst nach Ab-/Neuanmeldung verfuegbar."
+                $status = "WARN"
+                $detail += "; nur 'Staged' fuer aktuelle Sitzung, Ab-/Neuanmeldung noetig"
+            }
+            else {
+                Write-Warning "[WARN] '$($folder.Name)' konnte fuer die aktuelle Sitzung nicht verifiziert werden (kein passender Eintrag in Get-AppxPackage)."
+                $status = "WARN"
+                $detail += "; nicht verifizierbar fuer aktuelle Sitzung"
+            }
         }
 
         $results += [PSCustomObject]@{ Folder = $folder.Name; Status = $status; Detail = $detail }
@@ -295,6 +347,11 @@ foreach ($folder in $appFolders) {
 Write-Host ""
 Write-Host "---> Zusammenfassung:"
 $results | Format-Table -AutoSize
+
+$warnCount = @($results | Where-Object Status -eq "WARN").Count
+if ($warnCount -gt 0) {
+    Write-Warning "$warnCount Paket(e) wurden provisioniert, konnten aber nicht als sofort einsatzbereit verifiziert werden (Details siehe Detail-Spalte; ggf. Ab-/Neuanmeldung noetig)."
+}
 
 $failCount = @($results | Where-Object Status -eq "FAIL").Count
 if ($failCount -gt 0) {
