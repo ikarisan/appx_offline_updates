@@ -1,3 +1,9 @@
+# ACHTUNG!
+
+Dies ist ein privates "proof of concept" Projekt und aktuell zu >60% KI generiert.
+Wer mag, der darf es testen und mir Feedback geben. 
+Aber ich übernehme KEINE Garantie dafür, dass die Skripte das machen, was sie versprechen! :D 
+
 # Appx Offline Updater
 
 Zwei PowerShell-Skripte, um APPX/MSIX-Pakete (z. B. Standard-Windows-Apps wie
