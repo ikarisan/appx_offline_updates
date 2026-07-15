@@ -237,7 +237,17 @@ function Export-PackageViaWinget {
                     if ($existing -and $existing.BaseName -like "*$availableVersion*") {
                         $hash = Get-FileHash -Path $existing.FullName -Algorithm SHA256
                         Write-Host "[SKIP] Bereits vorhanden (Version $availableVersion): $($existing.Name)"
-                        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "Uebersprungen (bereits vorhanden, gleiche Version)" -Version $availableVersion -ExportPath $DestFolder -MainFile $existing.Name -SHA256 $hash.Hash
+
+                        # Dependencies-Spalte aus dem vorhandenen Manifest uebernehmen,
+                        # damit sie beim Ueberspringen nicht verloren geht (die Dateien
+                        # liegen aus dem frueheren Lauf bereits im gemeinsamen Ordner).
+                        $prevDeps = $null
+                        $prevRow = $script:PreviousManifest |
+                            Where-Object { $_.PackageName -eq $Entry -and $_.Dependencies } |
+                            Select-Object -First 1
+                        if ($prevRow) { $prevDeps = @($prevRow.Dependencies -split ";" | Where-Object { $_ }) }
+
+                        return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "Uebersprungen (bereits vorhanden, gleiche Version)" -Version $availableVersion -ExportPath $DestFolder -MainFile $existing.Name -SHA256 $hash.Hash -Dependencies $prevDeps
                     }
                 }
             }
@@ -517,6 +527,7 @@ function Export-PackageViaStoreApi {
         # Ordner nach dem Paketnamen benennen (z. B. "Microsoft.WindowsCalculator"),
         # nicht nach der rohen Store-Produkt-ID.
         $folderSafeName = ($catalogInfo.MainName -replace '[<>:"/\\|?*]', "_")
+        if (-not $folderSafeName) { $folderSafeName = $ProductId }
         $DestFolder = Join-Path -Path $ExportRoot -ChildPath $folderSafeName
         if (-not (Test-Path -Path $DestFolder)) {
             New-Item -Path $DestFolder -ItemType Directory -Force | Out-Null
@@ -603,6 +614,12 @@ function Export-PackageViaStoreApi {
         return New-ManifestEntry -PackageName $Entry -Status "OK" -Detail "" -Version $main.Version -ExportPath $DestFolder -MainFile $mainFileName -SHA256 $hash.Hash -Dependencies $collectedDeps
     }
     catch {
+        # Liegengebliebene Teil-Downloads entfernen
+        if ($DestFolder) {
+            Remove-Item -Path (Join-Path -Path $DestFolder -ChildPath "_main.tmp") -Force -ErrorAction SilentlyContinue
+        }
+        Remove-Item -Path (Join-Path -Path (Join-Path -Path $ExportRoot -ChildPath "Dependencies") -ChildPath "_dep.tmp") -Force -ErrorAction SilentlyContinue
+
         Write-Warning "[FAIL] Store-API-Download fehlgeschlagen fuer '$Entry': $($_.Exception.Message)"
         return New-ManifestEntry -PackageName $Entry -Status "FAIL" -Detail "Store-API Fehler: $($_.Exception.Message)" -Version $null -ExportPath $DestFolder -MainFile $null -SHA256 $null
     }
@@ -1346,6 +1363,15 @@ if (-not (Test-Path -Path $ExportRoot)) {
     New-Item -Path $ExportRoot -ItemType Directory -Force | Out-Null
 }
 
+# Vorhandenes Manifest einlesen: wird beim Schreiben zusammengefuehrt (damit
+# Teillaeufe die Eintraege anderer Pakete nicht verwerfen) und liefert bei
+# -SkipExisting die Dependencies-Spalte uebersprungener winget-Pakete.
+$manifestPath = Join-Path -Path $ExportRoot -ChildPath "export-manifest.csv"
+$script:PreviousManifest = @()
+if (Test-Path -Path $manifestPath) {
+    $script:PreviousManifest = @(Import-Csv -Path $manifestPath)
+}
+
 foreach ($entry in $PackageNames) {
 
     $id = Resolve-PackageIdentifier -Entry $entry
@@ -1360,16 +1386,32 @@ foreach ($entry in $PackageNames) {
     }
 }
 
-$manifestPath = Join-Path -Path $ExportRoot -ChildPath "export-manifest.csv"
-$manifestEntries | Export-Csv -Path $manifestPath -NoTypeInformation -Encoding UTF8
+# Zusammenfassungs-Zahlen beziehen sich nur auf die in DIESEM Lauf
+# verarbeiteten Pakete (vor dem Merge mit alten Manifest-Zeilen ermitteln).
+$runTotal = $manifestEntries.Count
+$failCount = @($manifestEntries | Where-Object Status -ne "OK").Count
+
+# Manifest mergen statt ueberschreiben: Zeilen frueher exportierter Pakete,
+# die in diesem Lauf nicht verarbeitet wurden, bleiben erhalten - sonst
+# verliert Import-AppxPackagesOffline.ps1 deren Abhaengigkeits-Infos und
+# installiert diese Pakete still ohne Abhaengigkeiten.
+$allEntries = $manifestEntries
+if ($script:PreviousManifest.Count -gt 0) {
+    $processedNames = @($manifestEntries | ForEach-Object { $_.PackageName })
+    $manifestColumns = "PackageName", "Status", "Detail", "Version", "ExportPath", "MainFile", "SHA256", "Dependencies", "ExportedAtUtc"
+    $kept = @($script:PreviousManifest |
+        Where-Object { $processedNames -notcontains $_.PackageName } |
+        Select-Object -Property $manifestColumns)
+    $allEntries = @($kept) + @($manifestEntries)
+}
+$allEntries | Export-Csv -Path $manifestPath -NoTypeInformation -Encoding UTF8
 
 Write-Host ""
-Write-Host "---> Manifest geschrieben: $manifestPath"
+Write-Host "---> Manifest geschrieben: $manifestPath ($($allEntries.Count) Eintraege, davon $runTotal aus diesem Lauf)"
 
-$failCount = @($manifestEntries | Where-Object Status -ne "OK").Count
 if ($failCount -gt 0) {
-    Write-Warning "$failCount von $($manifestEntries.Count) Paket(en) konnten nicht vollstaendig heruntergeladen werden. Details siehe Manifest."
+    Write-Warning "$failCount von $runTotal Paket(en) konnten nicht vollstaendig heruntergeladen werden. Details siehe Manifest."
 }
 else {
-    Write-Host "Alle $($manifestEntries.Count) Paket(e) erfolgreich heruntergeladen."
+    Write-Host "Alle $runTotal Paket(e) erfolgreich heruntergeladen."
 }

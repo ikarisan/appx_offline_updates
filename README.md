@@ -97,7 +97,10 @@ SHA256-Hash und in der Spalte `Dependencies` die Liste der von diesem Paket
 tatsaechlich benoetigten Abhaengigkeitsdateien (mehrere durch `;` getrennt).
 Sie wird von `Import-AppxPackagesOffline.ps1` genutzt, um pro Paket genau
 diese – und nur diese – Abhaengigkeiten per `-DependencyPath` zu installieren
-(sowie bei `-VerifyHash` fuer die SHA256-Pruefung).
+(sowie bei `-VerifyHash` fuer die SHA256-Pruefung). Bei Teillaeufen (z. B.
+mit `-PackageNames` fuer ein einzelnes Paket) wird das Manifest
+zusammengefuehrt statt ueberschrieben – Eintraege frueher exportierter
+Pakete bleiben erhalten.
 
 ---
 
@@ -150,9 +153,19 @@ Da beide Schritte ohne Fehler zurueckkehren koennen, ohne dass das Paket
 fuer die aktuelle Sitzung wirklich nutzbar ist (z. B. wenn es fuer den
 aktuellen Benutzer nur als "Staged" statt "Installed" registriert wurde),
 verifiziert das Skript den tatsaechlichen Zustand anschliessend per
-`Get-AppxProvisionedPackage` bzw. `Get-AppxPackage`. Kann das nicht bestaetigt
-werden, erscheint in der Ergebnistabelle der Status `WARN` statt `OK`
-(Detail-Spalte nennt den Grund, meist "Ab-/Neuanmeldung noetig").
+`Get-AppxProvisionedPackage` bzw. `Get-AppxPackage`. Wird dabei der Zustand
+"Staged" festgestellt, registriert das Skript das Paket automatisch per
+`Add-AppxPackage -RegisterByFamilyName` direkt fuer die aktuelle Sitzung.
+Nur wenn auch das nicht gelingt, erscheint in der Ergebnistabelle der Status
+`WARN` statt `OK` (Detail-Spalte nennt den Grund, meist "Ab-/Neuanmeldung
+noetig").
+
+Vor jeder Installation prueft das Skript ausserdem, ob das Paket bereits in
+gleicher oder neuerer Version auf dem System vorhanden ist – Name und
+Version werden dazu direkt aus der Paketdatei gelesen. In dem Fall wird
+nichts installiert und der Status `SKIP` gemeldet (haeufig bei unter
+Windows 11 vorinstallierten Apps wie dem Snipping Tool). Eine aeltere
+vorhandene Version wird dagegen normal aktualisiert.
 
 ### Voraussetzungen
 
@@ -185,7 +198,9 @@ werden, erscheint in der Ergebnistabelle der Status `WARN` statt `OK`
 | `-ForceApplicationShutdown` | Beendet bei der Sofort-Installation laufende Prozesse des Pakets, um HRESULT 0x80073D02 ("Ressourcen werden verwendet") zu beheben. Ohne diesen Schalter wiederholt das Skript bei genau diesem Fehler die Sofort-Installation automatisch einmal mit erzwungenem Beenden. |
 | `-Force` | Ueberspringt die PowerShell-5.1-Pruefung (nur verwenden, wenn unter PowerShell 7 getestet). |
 
-Das Skript durchsucht `-SourceRoot` nach Unterordnern, findet darin jeweils
+Das Skript durchsucht `-SourceRoot` nach Unterordnern (der gemeinsame
+`Dependencies`-Ordner selbst wird dabei uebersprungen – er enthaelt nur
+Framework-Pakete und ist kein App-Ordner), findet darin jeweils
 die Hauptpaketdatei (`.msixbundle`/`.appxbundle` bevorzugt, sonst
 `.msix`/`.appx`) und ermittelt aus der Spalte `Dependencies` des Manifests,
 welche Dateien aus dem gemeinsamen `Dependencies`-Ordner das Paket benoetigt.

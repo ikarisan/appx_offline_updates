@@ -33,8 +33,19 @@
     naechsten Anmeldung aktiv wird). Das Skript verifiziert deshalb nach
     beiden Schritten per Get-AppxProvisionedPackage bzw. Get-AppxPackage, ob
     das Paket wirklich (a) provisioniert und (b) fuer die aktuelle Sitzung
-    installiert ist, und meldet den Status "WARN" statt "OK", wenn das nicht
-    bestaetigt werden kann (siehe Detail-Spalte fuer den genauen Grund).
+    installiert ist. Stellt die Verifikation den Zustand "Staged" fest, wird
+    das Paket per Add-AppxPackage -RegisterByFamilyName direkt fuer die
+    aktuelle Sitzung registriert (ohne erneutes Staging); nur wenn auch das
+    fehlschlaegt, wird der Status "WARN" statt "OK" gemeldet (siehe
+    Detail-Spalte fuer den genauen Grund).
+
+    Vor jeder Installation prueft das Skript ausserdem, ob das Paket bereits
+    in gleicher oder neuerer Version auf dem System vorhanden ist. Name und
+    Version werden dazu direkt aus der Paketdatei gelesen (AppxManifest bzw.
+    AppxBundleManifest), da Ordner- und Dateinamen nicht garantiert dem
+    echten Appx-Identity-Namen entsprechen. Ist bereits eine gleiche oder
+    neuere Version vorhanden, wird nichts installiert und der Status "SKIP"
+    gemeldet (eine aeltere vorhandene Version wird normal aktualisiert).
 
 .PARAMETER SourceRoot
     Ordner mit den exportierten Paket-Unterordnern (auf das Air-Gapped
@@ -139,8 +150,93 @@ elseif ($VerifyHash) {
     Write-Warning "Fahre ohne Hash-Pruefung fort."
 }
 
+function Get-PackageIdentityFromFile {
+    <#
+        Liest den Appx-Identity-Namen und die Version direkt aus der
+        Paketdatei (Bundle: AppxMetadata/AppxBundleManifest.xml, Einzelpaket:
+        AppxManifest.xml). Zuverlaessiger als Ordner-/Dateiname, die (v. a.
+        beim winget-Pfad) nicht garantiert dem Identity-Namen entsprechen.
+        Gibt $null zurueck, wenn die Datei nicht lesbar ist.
+    #>
+    param([string]$PackagePath)
+
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($PackagePath)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.FullName -eq "AppxMetadata/AppxBundleManifest.xml" }
+            if (-not $entry) {
+                $entry = $zip.Entries | Where-Object { $_.FullName -eq "AppxManifest.xml" }
+            }
+            if (-not $entry) { return $null }
+
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            $manifestText = $reader.ReadToEnd()
+            $reader.Close()
+
+            if ($manifestText -notmatch '<Identity[^>]*\sName="([^"]+)"') { return $null }
+            $name = $Matches[1]
+            $version = $null
+            if ($manifestText -match '<Identity[^>]*\sVersion="([^"]+)"') { $version = $Matches[1] }
+
+            return [PSCustomObject]@{ Name = $name; Version = $version }
+        }
+        finally {
+            $zip.Dispose()
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Compare-AppxVersion {
+    param([string]$VersionA, [string]$VersionB)
+    $partsA = $VersionA -split "\." | ForEach-Object { [int]$_ }
+    $partsB = $VersionB -split "\." | ForEach-Object { [int]$_ }
+    for ($i = 0; $i -lt [Math]::Max($partsA.Count, $partsB.Count); $i++) {
+        $a = if ($i -lt $partsA.Count) { $partsA[$i] } else { 0 }
+        $b = if ($i -lt $partsB.Count) { $partsB[$i] } else { 0 }
+        if ($a -ne $b) { return $a - $b }
+    }
+    return 0
+}
+
+function Register-StagedPackage {
+    <#
+        Registriert ein bereits provisioniertes/gestagtes Paket sofort fuer
+        den aktuellen Benutzer, ohne es erneut zu stagen. Gibt $true bei
+        Erfolg zurueck.
+    #>
+    param([string]$PackageFamilyName)
+
+    try {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage $PackageFamilyName -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Write-Warning "[WARN] Registrierung des gestagten Pakets '$PackageFamilyName' fehlgeschlagen: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-InstalledPackageHighestVersion {
+    # Liefert das systemweit registrierte Paket mit der hoechsten Version
+    # (Get-AppxPackage -AllUsers kann mehrere Versionen zurueckgeben).
+    param([string]$Name)
+
+    return Get-AppxPackage -AllUsers -Name $Name -ErrorAction SilentlyContinue |
+        Sort-Object -Property { [version]$_.Version } -Descending |
+        Select-Object -First 1
+}
+
 $results = @()
-$appFolders = Get-ChildItem -Path $SourceRoot -Directory
+
+# Den gemeinsamen "Dependencies"-Ordner ueberspringen - er enthaelt nur
+# Framework-Abhaengigkeiten und ist kein App-Ordner (Framework-Pakete lassen
+# sich nicht provisionieren).
+$appFolders = @(Get-ChildItem -Path $SourceRoot -Directory |
+    Where-Object { $_.Name -ne "Dependencies" })
 
 if ($appFolders.Count -eq 0) {
     Write-Warning "[WARN] Keine Unterordner unter $SourceRoot gefunden. Nichts zu installieren."
@@ -169,6 +265,14 @@ foreach ($folder in $appFolders) {
         continue
     }
 
+    # Echten Appx-Identity-Namen (+ Version) aus der Paketdatei lesen; der
+    # Ordnername dient nur als Fallback, falls die Datei nicht lesbar ist.
+    $identity = Get-PackageIdentityFromFile -PackagePath $mainFile.FullName
+    $pkgName = if ($identity) { $identity.Name } else { $folder.Name }
+    if (-not $identity) {
+        Write-Warning "[WARN] Identity aus '$($mainFile.Name)' nicht lesbar, verwende Ordnernamen '$($folder.Name)' fuer die Verifikation."
+    }
+
     # Manifest-Eintrag fuer dieses Paket ermitteln (wird sowohl fuer -VerifyHash
     # als auch fuer die Abhaengigkeits-Aufloesung ueber die "Dependencies"-Spalte
     # benoetigt).
@@ -194,6 +298,40 @@ foreach ($folder in $appFolders) {
         }
         else {
             Write-Warning "[WARN] Kein Manifest-Eintrag fuer $($mainFile.Name), Hash-Pruefung nicht moeglich."
+        }
+    }
+
+    # --- Vorab-Check: Paket bereits in gleicher oder neuerer Version vorhanden? ---
+    # (Haeufig bei unter Windows vorinstallierten Apps. Ohne diesen Check laeuft
+    # die Sofort-Installation in einen Downgrade-Fehler; eine AELTERE vorhandene
+    # Version wird dagegen normal aktualisiert.)
+    if ($identity -and $identity.Version) {
+        $already = Get-InstalledPackageHighestVersion -Name $pkgName
+        if ($already -and (Compare-AppxVersion $already.Version $identity.Version) -ge 0) {
+            Write-Host "[SKIP] '$pkgName' ist bereits in Version $($already.Version) vorhanden (Import-Version: $($identity.Version))."
+            $detail = "Bereits vorhanden in Version $($already.Version), Import-Version $($identity.Version)"
+
+            # Ist das vorhandene Paket fuer die aktuelle Sitzung nur "Staged",
+            # jetzt direkt registrieren statt auf die naechste Anmeldung zu warten.
+            if (-not $SkipCurrentUserInstall) {
+                $currentSid = $currentIdentity.User.Value
+                $stagedHere = $already.PackageUserInformation |
+                    Where-Object { $_.UserSecurityId.ToString() -like "$currentSid*" -and $_.InstallState -eq "Staged" } |
+                    Select-Object -First 1
+                if ($stagedHere) {
+                    Write-Host "       Fuer die aktuelle Sitzung nur 'Staged' - registriere jetzt..."
+                    if (Register-StagedPackage -PackageFamilyName $already.PackageFamilyName) {
+                        Write-Host "[OK] '$pkgName' fuer die aktuelle Sitzung registriert."
+                        $detail += "; war 'Staged', jetzt fuer aktuelle Sitzung registriert"
+                    }
+                    else {
+                        $detail += "; 'Staged' fuer aktuelle Sitzung, Registrierung fehlgeschlagen (Ab-/Neuanmeldung noetig)"
+                    }
+                }
+            }
+
+            $results += [PSCustomObject]@{ Folder = $folder.Name; Status = "SKIP"; Detail = $detail }
+            continue
         }
     }
 
@@ -246,7 +384,7 @@ foreach ($folder in $appFolders) {
         # Get-AppxProvisionedPackage auftaucht (seltener Randfall) - lieber
         # ehrlich als "WARN" statt ungeprueft "OK" melden.
         $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
-            Where-Object { $_.PackageName -like "$($folder.Name)_*" }
+            Where-Object { $_.PackageName -like "$($pkgName)_*" }
 
         if ($provisioned) {
             Write-Host "[OK] Systemweit provisioniert (verifiziert): $($mainFile.Name) -> $($provisioned.PackageName) (bestehende Benutzer ab naechster Anmeldung, neue Benutzer automatisch)"
@@ -254,7 +392,7 @@ foreach ($folder in $appFolders) {
             $detail = "Provisioniert und verifiziert per Get-AppxProvisionedPackage"
         }
         else {
-            Write-Warning "[WARN] Add-AppxProvisionedPackage meldete Erfolg, aber '$($folder.Name)' erscheint nicht in Get-AppxProvisionedPackage."
+            Write-Warning "[WARN] Add-AppxProvisionedPackage meldete Erfolg, aber '$pkgName' erscheint nicht in Get-AppxProvisionedPackage."
             $status = "WARN"
             $detail = "Provisionierung meldete Erfolg, konnte aber nicht per Get-AppxProvisionedPackage verifiziert werden"
         }
@@ -287,7 +425,9 @@ foreach ($folder in $appFolders) {
             catch {
                 # 0x80073D02: Ressourcen/Prozesse des Pakets in Verwendung. Wurde noch
                 # nicht mit erzwungenem Shutdown versucht -> genau einmal wiederholen.
-                $isInUseError = $_.Exception.Message -match "0x80073D02"
+                # (HResult-Vergleich per Hex-String, da die Fehlermeldung lokalisiert
+                # ist und den Code nicht in jedem Fall enthaelt.)
+                $isInUseError = (("0x{0:X8}" -f $_.Exception.HResult) -eq "0x80073D02") -or ($_.Exception.Message -match "0x80073D02")
                 if ($isInUseError -and -not $ForceApplicationShutdown) {
                     Write-Warning "[WARN] $($mainFile.Name): App/Ressourcen in Verwendung (0x80073D02). Wiederhole mit erzwungenem Beenden laufender Prozesse..."
                     try {
@@ -312,7 +452,7 @@ foreach ($folder in $appFolders) {
             # wirklich verfuegbar ist. Deshalb den tatsaechlichen Zustand ueber
             # PackageUserInformation der aktuell angemeldeten SID pruefen.
             $currentSid = $currentIdentity.User.Value
-            $installedPkg = Get-AppxPackage -AllUsers -Name $folder.Name -ErrorAction SilentlyContinue
+            $installedPkg = Get-InstalledPackageHighestVersion -Name $pkgName
             $currentUserEntry = $null
             if ($installedPkg) {
                 $currentUserEntry = $installedPkg.PackageUserInformation |
@@ -321,16 +461,35 @@ foreach ($folder in $appFolders) {
             }
 
             if ($currentUserEntry -and $currentUserEntry.InstallState -eq "Installed") {
-                Write-Host "[OK] Verifiziert: '$($folder.Name)' ist fuer die aktuelle Sitzung installiert."
+                Write-Host "[OK] Verifiziert: '$pkgName' ist fuer die aktuelle Sitzung installiert."
                 $detail += "; verifiziert: fuer aktuelle Sitzung installiert"
             }
             elseif ($currentUserEntry -and $currentUserEntry.InstallState -eq "Staged") {
-                Write-Warning "[WARN] '$($folder.Name)' ist fuer die aktuelle Sitzung nur 'Staged' - wird erst nach Ab-/Neuanmeldung verfuegbar."
-                $status = "WARN"
-                $detail += "; nur 'Staged' fuer aktuelle Sitzung, Ab-/Neuanmeldung noetig"
+                # Direkte Abhilfe: das bereits gestagte Paket sofort fuer den
+                # aktuellen Benutzer registrieren (kein erneutes Staging noetig).
+                Write-Warning "[WARN] '$pkgName' ist fuer die aktuelle Sitzung nur 'Staged' - versuche direkte Registrierung..."
+                $nowInstalled = $false
+                if (Register-StagedPackage -PackageFamilyName $installedPkg.PackageFamilyName) {
+                    $recheck = Get-InstalledPackageHighestVersion -Name $pkgName
+                    if ($recheck) {
+                        $recheckEntry = $recheck.PackageUserInformation |
+                            Where-Object { $_.UserSecurityId.ToString() -like "$currentSid*" } |
+                            Select-Object -First 1
+                        $nowInstalled = ($recheckEntry -and $recheckEntry.InstallState -eq "Installed")
+                    }
+                }
+
+                if ($nowInstalled) {
+                    Write-Host "[OK] '$pkgName' nach direkter Registrierung fuer die aktuelle Sitzung installiert."
+                    $detail += "; war 'Staged', nach Registrierung fuer aktuelle Sitzung installiert"
+                }
+                else {
+                    $status = "WARN"
+                    $detail += "; nur 'Staged' fuer aktuelle Sitzung, Ab-/Neuanmeldung noetig"
+                }
             }
             else {
-                Write-Warning "[WARN] '$($folder.Name)' konnte fuer die aktuelle Sitzung nicht verifiziert werden (kein passender Eintrag in Get-AppxPackage)."
+                Write-Warning "[WARN] '$pkgName' konnte fuer die aktuelle Sitzung nicht verifiziert werden (kein passender Eintrag in Get-AppxPackage)."
                 $status = "WARN"
                 $detail += "; nicht verifizierbar fuer aktuelle Sitzung"
             }
